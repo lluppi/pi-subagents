@@ -14,10 +14,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
-  return { ...actual, runAgent: vi.fn() };
+  return { ...actual, runAgent: vi.fn(), resumeAgent: vi.fn() };
 });
 
-import { runAgent } from "../src/agent-runner.js";
+import { type RunResult, resumeAgent, runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 import { ctx, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
@@ -28,6 +28,7 @@ let booted: Map<string, any> | undefined;
 beforeEach(() => {
   hermetic = hermeticDir({ settings: { schedulingEnabled: false } });
   vi.mocked(runAgent).mockReset();
+  vi.mocked(resumeAgent).mockReset();
 });
 
 afterEach(async () => {
@@ -48,15 +49,24 @@ function boot(branch: any[]) {
   return { tools, lifecycle };
 }
 
-/** Run an agent to completion in a first activation, shut it down, and return the agent's id. */
-async function finishedAgent(branch: any[]): Promise<string> {
+/**
+ * Run an agent to completion in a first activation, optionally resume it in the
+ * foreground, shut it down, and return the agent's id.
+ */
+async function finishedAgent(
+  branch: any[],
+  run: Partial<RunResult> = {},
+  resumed?: Awaited<ReturnType<typeof resumeAgent>>,
+): Promise<string> {
   vi.mocked(runAgent).mockResolvedValue({
     responseText: "THE-FULL-RESULT",
     session: { dispose: vi.fn() } as any,
     aborted: false,
     steered: false,
+    ...run,
   });
   const { tools, lifecycle } = boot(branch);
+  const context = ctx({ sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => branch) } });
   const res = await tools
     .get("Agent")
     .execute(
@@ -64,11 +74,18 @@ async function finishedAgent(branch: any[]): Promise<string> {
       { prompt: "Review the change.", description: "Review the change", subagent_type: "Explore", run_in_background: false },
       undefined,
       undefined,
-      ctx({ sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => branch) } }),
+      context,
     );
+  const id = (res as any).details.agentId;
+  if (resumed) {
+    vi.mocked(resumeAgent).mockResolvedValue(resumed);
+    await tools
+      .get("Agent")
+      .execute("tc-resume", { prompt: "Continue.", description: "Continue", subagent_type: "Explore", resume: id, run_in_background: false }, undefined, undefined, context);
+  }
   await lifecycle.get("session_shutdown")?.();
   booted = undefined;
-  return (res as any).details.agentId;
+  return id;
 }
 
 /** get_subagent_result in a fresh activation over the same branch. */
@@ -91,6 +108,24 @@ describe("get_subagent_result falls back to the saved record", () => {
     expect(out).toContain("Status: completed");
     expect(out).toContain("THE-FULL-RESULT");
     expect(out).toContain("saved record");
+  });
+
+  it("answers with a foreground resume's outcome, not the earlier run's", async () => {
+    const branch: any[] = [];
+    const id = await finishedAgent(branch, {}, { text: "THE-RESUMED-RESULT", aborted: false, steered: false });
+
+    const out = await readAfterReload(branch, id);
+    expect(out).toContain("THE-RESUMED-RESULT");
+    expect(out).not.toContain("THE-FULL-RESULT");
+  });
+
+  it("keeps a failed run's partial output, labelled as partial", async () => {
+    const branch: any[] = [];
+    const id = await finishedAgent(branch, { responseText: "THE-PARTIAL-OUTPUT", failure: "provider error" });
+
+    const out = await readAfterReload(branch, id);
+    expect(out).toContain("Status: error");
+    expect(out).toContain("Error: provider error\n\nPartial output before the failure:\nTHE-PARTIAL-OUTPUT");
   });
 
   it("still reports an id with no saved record as not found", async () => {

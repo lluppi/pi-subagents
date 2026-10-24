@@ -780,7 +780,7 @@ export default function (pi: ExtensionAPI) {
     `Type: ${getDisplayName(saved.type)} | Status: ${saved.status}${getStatusNote(saved.status)} | Duration: ${formatDuration(saved.startedAt, saved.completedAt)}\n` +
     `Description: ${saved.description}\n` +
     `(From the session's saved record: the live record has been cleaned up, so its stats and conversation are gone.)\n\n` +
-    (saved.status === "error" ? `Error: ${saved.error}` : saved.result?.trim() || "No output.");
+    (saved.status === "error" ? `Error: ${saved.error}${partialOutputSuffix(saved)}` : saved.result?.trim() || "No output.");
 
   const registryEntry = {
     waitForAll: () => manager.waitForAll(),
@@ -2226,6 +2226,10 @@ Terse command-style prompts produce shallow, generic work.
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
+        // A foreground resume settles inline, never through the completion
+        // callback, so persist its outcome here: get_subagent_result must find
+        // this run's result, not the earlier run's, once the live record is gone.
+        pi.appendEntry<AgentRecordEntryData>(AGENT_RECORD_ENTRY_TYPE, agentRecordEntryData(record));
         // A failed resume surfaces the error, plus any partial output THIS
         // resume produced (never the previous turn's answer, #144).
         if (record.status === "error") {
